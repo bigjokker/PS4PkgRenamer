@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: PS4PkgRenamer-windows.exe
+          - os: macos-latest
+            asset_name: PS4PkgRenamer-macos.zip
+          - os: ubuntu-latest
+            asset_name: PS4PkgRenamer-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Tkinter (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --windowed --name PS4PkgRenamer ps4pkg_renamer.py
+
+      - name: Build executable (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller --windowed --name PS4PkgRenamer ps4pkg_renamer.py
+
+      - name: Build executable (Linux)
+        if: runner.os == 'Linux'
+        run: pyinstaller --onefile --name PS4PkgRenamer ps4pkg_renamer.py
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp dist/PS4PkgRenamer.exe "${{ matrix.asset_name }}"
+
+      - name: Package artifact (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/PS4PkgRenamer.app "${{ matrix.asset_name }}"
+
+      - name: Package artifact (Linux)
+        if: runner.os == 'Linux'
+        run: cp dist/PS4PkgRenamer "${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
