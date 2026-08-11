@@ -50,7 +50,7 @@ For a folder of games, homebrew apps, or PS1/PS2/PSP-on-PS4 conversions (each ga
 1. Click **Browse...** and select the folder (e.g. `PS4/Games`, `PS4/Homebrew`, `PS4/Emulators`).
 2. Check **Also rename folders** if you also want each game's containing folder renamed to `Title [TitleID]`.
 3. Click **Preview** to see what would change without touching any files.
-4. Click **Apply** to actually rename. A confirmation dialog appears first, and a CSV manifest with every old → new filename is saved next to the target folder so you can revert manually if needed.
+4. Click **Apply** to actually rename. A confirmation dialog appears first.
 
 ### Push to End
 

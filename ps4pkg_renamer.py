@@ -2,13 +2,11 @@
 """PS4PkgRenamer — reads param.sfo from PS4 .pkg files to rename them for
 correct alphabetical sorting in flat package-list installers (GoldHEN)."""
 
-import csv
 import os
 import re
 import struct
 import unicodedata
 import tkinter as tk
-from datetime import datetime
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 APP_TITLE = "PS4PkgRenamer"
@@ -348,14 +346,14 @@ def rename_games(root: str, apply: bool, folders: bool, scan_mb: int, log):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         log(f"No existe la carpeta: {root}")
-        return {"total": 0, "unknown": 0, "renamed": 0, "manifest_path": None}
+        return {"total": 0, "unknown": 0, "renamed": 0}
 
     all_folders = list(find_game_folders(root))
     if not all_folders:
         log("No se encontraron archivos .pkg debajo de esa ruta.")
-        return {"total": 0, "unknown": 0, "renamed": 0, "manifest_path": None}
+        return {"total": 0, "unknown": 0, "renamed": 0}
 
-    manifest_rows = []
+    total_items = 0
     total_renamed = 0
     total_unknown = 0
 
@@ -369,13 +367,7 @@ def rename_games(root: str, apply: bool, folders: bool, scan_mb: int, log):
             log(f"  {it['filename']}  ->  {it['new_filename']}{flag}")
             if not it["found_metadata"]:
                 total_unknown += 1
-            manifest_rows.append({
-                "folder": folder,
-                "old_filename": it["filename"],
-                "new_filename": it["new_filename"],
-                "category_detected": it["label"],
-                "metadata_found": it["found_metadata"],
-            })
+            total_items += 1
 
         if apply:
             for it in items:
@@ -403,35 +395,18 @@ def rename_games(root: str, apply: bool, folders: bool, scan_mb: int, log):
                         os.rename(folder, new_folder)
                         log(f"  Carpeta renombrada -> {new_folder}")
 
-    log(f"\nTotal pkgs analizados: {len(manifest_rows)}")
+    log(f"\nTotal pkgs analizados: {total_items}")
     log(f"Sin metadata legible (se uso respaldo por numero 1/2/3): {total_unknown}")
 
-    manifest_path = None
     if apply:
         log(f"Renombrados: {total_renamed}")
-        # 'root' puede haber sido renombrado (si folders=True y root era la
-        # propia carpeta del juego), asi que se cae a su carpeta padre.
-        manifest_dir = root if os.path.isdir(root) else os.path.dirname(root.rstrip(os.sep))
-        if not os.path.isdir(manifest_dir):
-            manifest_dir = os.getcwd()
-        manifest_path = os.path.join(
-            manifest_dir, f"rename_manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        with open(manifest_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "folder", "old_filename", "new_filename", "category_detected", "metadata_found"
-            ])
-            writer.writeheader()
-            writer.writerows(manifest_rows)
-        log(f"Manifest guardado en: {manifest_path}")
     else:
         log("\n(Simulacion. Nada se ha modificado.)")
 
     return {
-        "total": len(manifest_rows),
+        "total": total_items,
         "unknown": total_unknown,
         "renamed": total_renamed,
-        "manifest_path": manifest_path,
     }
 
 
@@ -535,9 +510,7 @@ class PS4PkgRenamerApp(tk.Tk):
     def _apply_games(self):
         if not messagebox.askyesno(
             APP_TITLE,
-            "This will rename .pkg files (and folders, if checked) on disk.\n\n"
-            "A CSV manifest with the old/new names will be saved so you can "
-            "revert manually if needed.\n\nContinue?",
+            "This will rename .pkg files (and folders, if checked) on disk.\n\nContinue?",
         ):
             return
         self._run_games(apply=True)
