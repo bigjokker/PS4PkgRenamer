@@ -41,7 +41,7 @@ No installation needed — just download and run.
 
 ## Usage
 
-Open the app. It has two tabs:
+Open the app. It has three tabs:
 
 ### Rename Games
 
@@ -61,6 +61,16 @@ For a flat folder of unrelated pkgs (e.g. a PS4 theme pack) that you want sorted
 3. Preview, then Apply.
 
 Running it again on an already-processed folder is safe — files that already have the prefix (or are already correctly named) are skipped.
+
+### Install Order
+
+The PS4 needs free space on its internal storage to install each game. If you install in alphabetical order, a heavy game near the end of the list can end up with no room left, even though it would have fit fine if installed earlier. This tab doesn't rename anything — it just reads file sizes and gives you a reference list, heaviest first, so you know what to install while space is still abundant.
+
+1. **Add Folder...** one or more roots (e.g. `Games`, `Homebrew`, `Emulators`, `Themes`).
+2. Click **Generate Report** — it sums up every game folder's `.pkg` sizes (base + update + DLC combined) and lists them from heaviest to lightest, with a running total.
+3. **Save Report...** to keep it as a text file.
+
+The pkg file size is a close approximation of the actual installed size, not an exact figure — leave some extra headroom rather than installing right up to the limit.
 
 ---
 

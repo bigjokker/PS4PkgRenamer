@@ -453,6 +453,70 @@ def push_to_end(root: str, prefix: str, apply: bool, log):
     return {"total": total, "already": already, "renamed": renamed}
 
 
+def human_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.2f} PB"
+
+
+def install_order(roots, log):
+    """Suma el tamano de los .pkg de cada carpeta de juego bajo `roots` (una
+    o mas rutas) y devuelve la lista ordenada de mas pesada a mas liviana.
+    Es de solo lectura: no renombra ni mueve nada.
+
+    La PS4 necesita espacio libre en el almacenamiento interno para
+    instalar cada juego. Instalar siguiendo el orden alfabetico de la
+    lista arriesga que un juego pesado que aparece "al final" ya no
+    tenga espacio libre para cuando le toque, aunque si se hubiera
+    instalado primero (con mas espacio disponible) si habria cabido.
+    Instalar de mas pesado a mas liviano evita ese problema."""
+    entries = []
+    seen_folders = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            log(f"[!] No existe: {root}")
+            continue
+        for folder in find_game_folders(root):
+            if folder in seen_folders:
+                continue
+            seen_folders.add(folder)
+            pkgs = [f for f in os.listdir(folder) if f.lower().endswith(".pkg")]
+            total = sum(os.path.getsize(os.path.join(folder, f)) for f in pkgs)
+            entries.append({
+                "folder": folder,
+                "name": os.path.basename(folder.rstrip(os.sep)),
+                "num_pkgs": len(pkgs),
+                "total_bytes": total,
+            })
+
+    if not entries:
+        log("No se encontraron carpetas con .pkg.")
+        return []
+
+    entries.sort(key=lambda e: e["total_bytes"], reverse=True)
+
+    running_total = 0
+    log(f"\n{'#':>3}  {'Tamaño':>10}  {'Acumulado':>10}  {'Pkgs':>4}  Carpeta")
+    log("-" * 80)
+    for i, e in enumerate(entries, start=1):
+        running_total += e["total_bytes"]
+        log(
+            f"{i:>3}  {human_size(e['total_bytes']):>10}  {human_size(running_total):>10}  "
+            f"{e['num_pkgs']:>4}  {e['name']}"
+        )
+
+    log("-" * 80)
+    log(f"Total: {len(entries)} carpetas, {human_size(running_total)} en total.")
+    log(
+        "\nSugerencia: instala en este orden (de arriba hacia abajo) para asegurar\n"
+        "que los juegos mas pesados se instalen mientras hay mas espacio libre."
+    )
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -469,11 +533,14 @@ class PS4PkgRenamerApp(tk.Tk):
 
         self.games_tab = ttk.Frame(notebook)
         self.themes_tab = ttk.Frame(notebook)
+        self.order_tab = ttk.Frame(notebook)
         notebook.add(self.games_tab, text="Rename Games")
         notebook.add(self.themes_tab, text="Push to End")
+        notebook.add(self.order_tab, text="Install Order")
 
         self._build_games_tab()
         self._build_themes_tab()
+        self._build_order_tab()
 
     # --- Rename Games tab ---
     def _build_games_tab(self):
@@ -587,6 +654,70 @@ class PS4PkgRenamerApp(tk.Tk):
             apply=apply,
             log=lambda msg: self._log(self.themes_log, msg),
         )
+
+    # --- Install Order tab ---
+    def _build_order_tab(self):
+        frame = self.order_tab
+
+        ttk.Label(
+            frame,
+            text="Folders to include (e.g. Games, Homebrew, Emulators, Themes):",
+        ).pack(anchor="w", padx=10, pady=(10, 0))
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="x", padx=10, pady=(5, 0))
+        self.order_listbox = tk.Listbox(list_frame, height=4, selectmode="extended")
+        self.order_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.order_listbox.yview)
+        scrollbar.pack(side="left", fill="y")
+        self.order_listbox.configure(yscrollcommand=scrollbar.set)
+
+        list_buttons = ttk.Frame(frame)
+        list_buttons.pack(fill="x", padx=10, pady=(5, 10))
+        ttk.Button(list_buttons, text="Add Folder...", command=self._add_order_folder).pack(side="left")
+        ttk.Button(list_buttons, text="Remove Selected", command=self._remove_order_folder).pack(
+            side="left", padx=(5, 0)
+        )
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Generate Report", command=self._run_order).pack(side="left")
+        ttk.Button(buttons, text="Save Report...", command=self._save_order_report).pack(side="left", padx=(5, 0))
+
+        self.order_log = scrolledtext.ScrolledText(frame, state="disabled", wrap="none")
+        self.order_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _add_order_folder(self):
+        folder = filedialog.askdirectory(title="Select a folder to include")
+        if folder and folder not in self.order_listbox.get(0, tk.END):
+            self.order_listbox.insert(tk.END, folder)
+
+    def _remove_order_folder(self):
+        for idx in reversed(self.order_listbox.curselection()):
+            self.order_listbox.delete(idx)
+
+    def _run_order(self):
+        roots = list(self.order_listbox.get(0, tk.END))
+        if not roots:
+            messagebox.showerror(APP_TITLE, "Add at least one folder first.")
+            return
+        self._clear_log(self.order_log)
+        install_order(roots, log=lambda msg: self._log(self.order_log, msg))
+
+    def _save_order_report(self):
+        content = self.order_log.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showerror(APP_TITLE, "Nothing to save yet — generate a report first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save report",
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt")],
+            initialfile="ps4_install_order.txt",
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
 
     # --- shared helpers ---
     def _browse_folder(self, path_var):
