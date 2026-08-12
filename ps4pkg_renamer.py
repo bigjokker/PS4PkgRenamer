@@ -10,7 +10,6 @@ import queue
 import re
 import struct
 import threading
-import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
@@ -21,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 APP_TITLE = "PS4PkgRenamer"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,8 +37,12 @@ MAX_SFO_SIZE = 1_000_000  # real param.sfo is tiny; reject absurd sizes
 CATEGORY_MAP = {
     "gd": ("base", 0, " - 0 Base"),
     "gde": ("base", 0, " - 0 Base"),  # demo treated as base
+    "gda": ("base", 0, " - 0 Base"),  # application-style base
     "gp": ("update", 1, " - 1 Update"),
+    "gpd": ("update", 1, " - 1 Update"),  # delta / partial patch
     "ac": ("dlc", 2, " - 2 DLC"),
+    "al": ("dlc", 2, " - 2 DLC"),  # additional content (some pubs)
+    "theme": ("theme", 8, " - 8 Theme"),
 }
 FALLBACK_DIGIT_MAP = {
     "1": ("base", 0, " - 0 Base"),
@@ -49,10 +52,26 @@ FALLBACK_DIGIT_MAP = {
 OTHER = ("other", 9, " - 9 Other")
 
 FORBIDDEN_CHARS = re.compile(r'[\\/:*?"<>|]')
+# PS4/PS5-style title IDs in CONTENT_ID: four letters + five digits.
+# No trailing \b — CONTENT_ID uses '_' after the id (word char), e.g. CUSA34384_00.
+TITLE_ID_RE = re.compile(r"([A-Z]{4}\d{5})", re.I)
+# Windows / exFAT reserved device names (match stem)
+WIN_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+# Max filename stem length (component limit 255; leave room for " (99).pkg")
+MAX_STEM_LEN = 200
+MAX_FILENAME_LEN = 255
 
 DEFAULT_SCAN_MB = 48
 DEFAULT_PREFIX = "ZZZ - "
 UNDO_LOG_NAME = ".ps4pkgrenamer_last_undo.json"
+SFO_SCAN_OVERLAP = 256 * 1024  # keep tail so SFO spanning chunks is found
 
 # Naming presets: {key: (display_name, description)}
 # Placeholders: {title} {title_id} {title_block} {order} {kind}
@@ -81,24 +100,28 @@ NAME_TEMPLATES = {
         0: "{title_block} - 0 Base{fw_tag}",
         1: "{title_block} - 1 Update{fw_tag}{version_tag}",
         2: "{title_block} - 2 DLC{fw_tag} - {dlc_title}",
+        8: "{title_block} - 8 Theme{fw_tag} - {dlc_title}",
         9: "{title_block} - 9 Other{fw_tag} - {dlc_title}",
     },
     "no_fw": {
         0: "{title_block} - 0 Base",
         1: "{title_block} - 1 Update{version_tag}",
         2: "{title_block} - 2 DLC - {dlc_title}",
+        8: "{title_block} - 8 Theme - {dlc_title}",
         9: "{title_block} - 9 Other - {dlc_title}",
     },
     "compact": {
         0: "{title_block} - Base",
         1: "{title_block} - Update{version_tag}",
         2: "{title_block} - DLC - {dlc_title}",
+        8: "{title_block} - Theme - {dlc_title}",
         9: "{title_block} - Other - {dlc_title}",
     },
     "title_only": {
         0: "{title} - Base",
         1: "{title} - Update{version_tag}",
         2: "{title} - DLC - {dlc_title}",
+        8: "{title} - Theme - {dlc_title}",
         9: "{title} - Other - {dlc_title}",
     },
 }
@@ -128,7 +151,24 @@ def finalize_filename(name: str) -> str:
     """Strip trailing dots/spaces invalid on exFAT/Windows from the full stem."""
     name = sanitize_name(name)
     name = name.rstrip(" .")
-    return name or "Unknown"
+    if not name:
+        return "Unknown"
+    # Avoid Windows reserved device names (CON, PRN, AUX, NUL, COM1…, LPT1…)
+    stem_head = name.split(".", 1)[0].upper()
+    if stem_head in WIN_RESERVED:
+        name = f"_{name}"
+    if len(name) > MAX_STEM_LEN:
+        name = name[:MAX_STEM_LEN].rstrip(" .") or "Unknown"
+    return name
+
+
+def with_pkg_ext(stem: str) -> str:
+    """Append .pkg and enforce max filename component length."""
+    stem = finalize_filename(stem)
+    ext = ".pkg"
+    if len(stem) + len(ext) > MAX_FILENAME_LEN:
+        stem = stem[: MAX_FILENAME_LEN - len(ext)].rstrip(" .") or "Unknown"
+    return stem + ext
 
 
 def nfc(path: str) -> str:
@@ -139,6 +179,10 @@ def same_path(a: str, b: str) -> bool:
     return nfc(os.path.normcase(os.path.abspath(a))) == nfc(
         os.path.normcase(os.path.abspath(b))
     )
+
+
+def path_parent(path: str) -> str:
+    return os.path.dirname(path.rstrip(os.sep))
 
 
 # ---------------------------------------------------------------------------
@@ -286,27 +330,34 @@ def extract_sfo_via_pkg_header(pkg_path: str) -> Optional[dict]:
 def extract_sfo_via_scan(
     pkg_path: str, scan_mb: int, log: Optional[LogFn] = None
 ) -> Optional[dict]:
-    """Fallback: read up to scan_mb and search for SFO magic."""
+    """Fallback: read up to scan_mb and search for SFO magic.
+
+    Keeps only a trailing overlap between chunks so large pkgs do not force
+    an ever-growing buffer (real param.sfo is tiny).
+    """
     max_bytes = scan_mb * 1024 * 1024
     chunk_size = 4 * 1024 * 1024
-    buf = b""
+    overlap = min(SFO_SCAN_OVERLAP, max_bytes)
+    tail = b""
     try:
         with open(pkg_path, "rb") as f:
             read_total = 0
             while read_total < max_bytes:
-                chunk = f.read(chunk_size)
+                to_read = min(chunk_size, max_bytes - read_total)
+                chunk = f.read(to_read)
                 if not chunk:
                     break
-                buf += chunk
+                buf = tail + chunk
                 read_total += len(chunk)
                 entries = find_sfo_in_buffer(buf)
                 if entries:
                     return entries
+                tail = buf[-overlap:] if len(buf) > overlap else buf
     except OSError as e:
         if log:
             log(f"  [ERROR] Could not read {pkg_path}: {e}")
         return None
-    return find_sfo_in_buffer(buf)
+    return find_sfo_in_buffer(tail) if tail else None
 
 
 def extract_sfo(
@@ -337,10 +388,13 @@ def content_id_from_header(pkg_path: str) -> Optional[str]:
 
 
 def title_id_from_content_id(content_id: Optional[str]) -> Optional[str]:
-    """Extract CUSAXXXXX from CONTENT_ID like UP9000-CUSA34384_00-..."""
+    """Extract title id from CONTENT_ID like UP9000-CUSA34384_00-...
+
+    Matches regional PS4/PS5-style ids (CUSA, PCAS, PLAS, PLJS, PPSA, …).
+    """
     if not content_id:
         return None
-    m = re.search(r"(CUSA\d{5}|PPSA\d{5}|CUSA\d+)", content_id, re.I)
+    m = TITLE_ID_RE.search(content_id)
     return m.group(1).upper() if m else None
 
 
@@ -415,9 +469,14 @@ def build_new_name(
     tmpl = templates.get(order, templates[9])
 
     fw_tag = f" (FW {fw_version}+)" if fw_version else ""
-    version_tag = f" v{version}" if version else ""
+    ver_str = ""
+    if version is not None and str(version).strip():
+        ver_str = sanitize_name(str(version).strip())
+    version_tag = f" v{ver_str}" if ver_str else ""
     title_block = item_label
-    kind = {0: "Base", 1: "Update", 2: "DLC", 9: "Other"}.get(order, "Other")
+    kind = {0: "Base", 1: "Update", 2: "DLC", 8: "Theme", 9: "Other"}.get(
+        order, "Other"
+    )
 
     name = tmpl.format(
         title=sanitize_name(base_title),
@@ -427,11 +486,11 @@ def build_new_name(
         kind=kind,
         fw=fw_version or "",
         fw_tag=fw_tag,
-        version=version or "",
+        version=ver_str,
         version_tag=version_tag,
         dlc_title=sanitize_name(dlc_or_other_title) if dlc_or_other_title else "Unknown",
     )
-    return finalize_filename(name) + ".pkg"
+    return with_pkg_ext(name)
 
 
 def scan_game_folder(
@@ -533,10 +592,10 @@ def scan_game_folder(
             dlc_title = it["title"] or ""
             if dlc_title:
                 dlc_title = sanitize_name(dlc_title)
-                dlc_title = strip_base_prefix(dlc_title, base_title)
+                dlc_title = strip_base_prefix(dlc_title, own_base)
             if not dlc_title:
                 dlc_title = sanitize_name(os.path.splitext(it["filename"])[0])
-        elif it["order"] == 9:
+        elif it["order"] in (8, 9):
             dlc_title = sanitize_name(
                 it["title"] or os.path.splitext(it["filename"])[0]
             )
@@ -562,7 +621,7 @@ def scan_game_folder(
         if key in seen:
             seen[key] += 1
             stem, ext = os.path.splitext(it["new_filename"])
-            it["new_filename"] = f"{stem} ({seen[key]}){ext}"
+            it["new_filename"] = with_pkg_ext(f"{stem} ({seen[key]})")
         else:
             seen[key] = 1
 
@@ -929,44 +988,48 @@ def rename_games(
                 continue
             ops.append((old_path, new_path))
 
-        if not ops:
-            continue
-        done = two_phase_rename(ops, log)
-        summary["renamed"] += len(done)
-        summary["skipped"] += len(ops) - len(done)
-        for old, new in done:
-            undo_records.append({"old": old, "new": new, "type": "file"})
-            # update path for folder rename base
-            for it in group:
-                if same_path(it["path"], old):
-                    it["path"] = new
+        # File renames first (folder rename still runs even if every file
+        # is already correctly named).
+        if ops:
+            done = two_phase_rename(ops, log)
+            summary["renamed"] += len(done)
+            summary["skipped"] += len(ops) - len(done)
+            for old, new in done:
+                undo_records.append({"old": old, "new": new, "type": "file"})
+                for it in group:
+                    if same_path(it["path"], old):
+                        it["path"] = new
 
         if folders and group:
             base_title = finalize_filename(group[0]["base_title"])
             parent = os.path.dirname(folder.rstrip(os.sep))
             new_folder = os.path.join(parent, base_title)
-            if not same_path(new_folder, folder.rstrip(os.sep)):
+            folder_path = folder.rstrip(os.sep)
+            if not same_path(new_folder, folder_path):
                 if os.path.exists(new_folder):
                     log(f"  [SKIP] folder target exists: {new_folder}")
                 else:
                     try:
-                        os.rename(folder, new_folder)
+                        os.rename(folder_path, new_folder)
                         log(f"  Folder renamed -> {new_folder}")
                         summary["folders_renamed"] += 1
-                        # File undo paths must reflect post-folder-rename location
-                        # so undo can restore names inside new_folder first, then
-                        # rename the folder back.
+                        # Only rewrite undo paths that lived under THIS folder.
+                        # (Rewriting every record corrupts multi-game undo logs.)
                         for rec in undo_records:
                             if rec.get("type") != "file":
                                 continue
                             for key in ("old", "new"):
                                 p = rec.get(key, "")
-                                if p:
+                                if p and same_path(path_parent(p), folder_path):
                                     rec[key] = os.path.join(
                                         new_folder, os.path.basename(p)
                                     )
                         undo_records.append(
-                            {"old": folder, "new": new_folder, "type": "folder"}
+                            {
+                                "old": folder_path,
+                                "new": new_folder,
+                                "type": "folder",
+                            }
                         )
                     except OSError as e:
                         log(f"  [ERROR] folder rename failed: {e}")
@@ -1061,6 +1124,15 @@ def push_to_end(
             log(f"  {fname}  (already has prefix)")
             continue
         new_name = prefix + fname
+        if len(new_name) > MAX_FILENAME_LEN:
+            # Keep prefix; trim the original stem to fit filesystem limits.
+            stem, ext = os.path.splitext(fname)
+            room = MAX_FILENAME_LEN - len(prefix) - len(ext)
+            if room < 1:
+                log(f"  [SKIP] prefix too long for filename limit: {fname}")
+                summary["skipped"] += 1
+                continue
+            new_name = prefix + stem[:room].rstrip(" .") + ext
         new_path = os.path.join(os.path.dirname(old_path), new_name)
         log(f"  {fname}  ->  {new_name}")
         summary["planned"] += 1
@@ -1130,7 +1202,8 @@ class PS4PkgRenamerApp(tk.Tk):
         self._worker: Optional[threading.Thread] = None
         self._msg_q: queue.Queue = queue.Queue()
         self._busy = False
-        self._last_preview_lines: List[str] = []
+        self._last_preview_lines_games: List[str] = []
+        self._last_preview_lines_themes: List[str] = []
         self._last_summary: dict = {}
 
         notebook = ttk.Notebook(self)
@@ -1323,7 +1396,7 @@ class PS4PkgRenamerApp(tk.Tk):
             return
 
         self._clear_log(self.games_log)
-        self._last_preview_lines = []
+        self._last_preview_lines_games = []
         self._set_busy(True)
         self.summary_var.set("Working...")
         self.progress["value"] = 0
@@ -1354,7 +1427,7 @@ class PS4PkgRenamerApp(tk.Tk):
                     log=log,
                     progress=prog,
                 )
-                self._last_preview_lines = lines_capture
+                self._last_preview_lines_games = lines_capture
                 self._msg_q.put(("done", (log_widget, summary, apply)))
             except Exception as e:
                 self._msg_q.put(("error", str(e)))
@@ -1364,7 +1437,10 @@ class PS4PkgRenamerApp(tk.Tk):
         self._worker.start()
 
     def _export_games_preview(self):
-        if not self._last_preview_lines:
+        self._export_preview_lines(self._last_preview_lines_games)
+
+    def _export_preview_lines(self, lines: List[str]):
+        if not lines:
             messagebox.showinfo(
                 APP_TITLE, "Run Preview first, then export the log."
             )
@@ -1379,16 +1455,16 @@ class PS4PkgRenamerApp(tk.Tk):
         try:
             if path.lower().endswith(".csv"):
                 rows = ["old,new,note"]
-                for line in self._last_preview_lines:
+                for line in lines:
                     if "  ->  " in line and not line.strip().startswith("=="):
                         left, right = line.strip().split("  ->  ", 1)
-                        # strip flags
                         note = ""
                         for tag in (
                             "  [header]",
                             "  [scan fallback]",
                             "  [!] no metadata — using filename fallback",
                             "  (unchanged)",
+                            "  (already has prefix)",
                         ):
                             if tag in right:
                                 note = tag.strip()
@@ -1398,24 +1474,28 @@ class PS4PkgRenamerApp(tk.Tk):
                         )
                 export_preview(path, rows)
             else:
-                export_preview(path, self._last_preview_lines)
+                export_preview(path, lines)
             messagebox.showinfo(APP_TITLE, f"Exported to:\n{path}")
         except OSError as e:
             messagebox.showerror(APP_TITLE, str(e))
 
-    def _undo_last(self):
+    def _undo_last(self, log_widget=None):
         if self._busy:
             return
-        # Prefer undo log inside selected folder, else pick file
+        log_widget = log_widget or self.games_log
+        # Prefer undo log inside selected folder (active tab path first)
         candidates = []
-        for path_var in (self.games_path_var, self.themes_path_var):
+        path_vars = (self.games_path_var, self.themes_path_var)
+        if log_widget is self.themes_log:
+            path_vars = (self.themes_path_var, self.games_path_var)
+        for path_var in path_vars:
             d = path_var.get().strip()
             if d:
                 p = os.path.join(d, UNDO_LOG_NAME)
                 if os.path.isfile(p):
                     candidates.append(p)
         home = os.path.join(str(Path.home()), UNDO_LOG_NAME)
-        if os.path.isfile(home):
+        if os.path.isfile(home) and home not in candidates:
             candidates.append(home)
 
         path = None
@@ -1443,9 +1523,8 @@ class PS4PkgRenamerApp(tk.Tk):
         ):
             return
 
-        self._clear_log(self.games_log)
+        self._clear_log(log_widget)
         self._set_busy(True)
-        log_widget = self.games_log
 
         def worker():
             def log(msg: str):
@@ -1455,10 +1534,21 @@ class PS4PkgRenamerApp(tk.Tk):
                 log(f"Undoing from: {path}\n")
                 summary = apply_undo(path, log)
                 self._msg_q.put(
-                    ("done", (log_widget, {"total": summary.get("undone", 0),
-                                           "renamed": summary.get("undone", 0),
-                                           "planned": 0, "header": 0,
-                                           "scan": 0, "unknown": 0}, True))
+                    (
+                        "done",
+                        (
+                            log_widget,
+                            {
+                                "total": summary.get("undone", 0),
+                                "renamed": summary.get("undone", 0),
+                                "planned": 0,
+                                "header": 0,
+                                "scan": 0,
+                                "unknown": 0,
+                            },
+                            True,
+                        ),
+                    )
                 )
             except Exception as e:
                 self._msg_q.put(("error", str(e)))
@@ -1508,7 +1598,13 @@ class PS4PkgRenamerApp(tk.Tk):
             buttons, text="Export preview...", command=self._export_themes_preview
         )
         b3.pack(side="left", padx=(5, 0))
-        self._action_buttons.extend([b1, b2, b3])
+        b4 = ttk.Button(
+            buttons,
+            text="Undo last...",
+            command=lambda: self._undo_last(self.themes_log),
+        )
+        b4.pack(side="left", padx=(5, 0))
+        self._action_buttons.extend([b1, b2, b3, b4])
 
         self.themes_log = scrolledtext.ScrolledText(
             frame, state="disabled", wrap="word", font=("Consolas", 9)
@@ -1534,13 +1630,18 @@ class PS4PkgRenamerApp(tk.Tk):
         if not target_dir or not os.path.isdir(target_dir):
             messagebox.showerror(APP_TITLE, f"Path not found:\n{target_dir}")
             return
-        prefix = self.prefix_var.get()
-        if not prefix:
-            messagebox.showerror(APP_TITLE, "Prefix cannot be empty.")
+        # Strip path-illegal characters from prefix; keep spaces and dashes.
+        prefix = FORBIDDEN_CHARS.sub("", self.prefix_var.get())
+        if not prefix or not prefix.strip():
+            messagebox.showerror(
+                APP_TITLE,
+                "Prefix cannot be empty (or only illegal path characters).",
+            )
             return
+        self.prefix_var.set(prefix)
 
         self._clear_log(self.themes_log)
-        self._last_preview_lines = []
+        self._last_preview_lines_themes = []
         self._set_busy(True)
         self.summary_var.set("Working...")
         recursive = self.themes_recursive_var.get()
@@ -1565,7 +1666,7 @@ class PS4PkgRenamerApp(tk.Tk):
                     log=log,
                     progress=prog,
                 )
-                self._last_preview_lines = lines_capture
+                self._last_preview_lines_themes = lines_capture
                 self._msg_q.put(("done", (log_widget, summary, apply)))
             except Exception as e:
                 self._msg_q.put(("error", str(e)))
@@ -1574,7 +1675,7 @@ class PS4PkgRenamerApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _export_themes_preview(self):
-        self._export_games_preview()  # same capture buffer
+        self._export_preview_lines(self._last_preview_lines_themes)
 
     # --- shared helpers ---
     def _configure_log_tags(self, widget):
