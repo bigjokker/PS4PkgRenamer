@@ -48,9 +48,9 @@ Open the app. It has three tabs:
 For folders of games, homebrew apps, or PS1/PS2/PSP-on-PS4 conversions (each game/app in its own subfolder, containing its base + update + DLC pkgs).
 
 1. **Add Folder...** one or more roots (e.g. `Games`, `Homebrew`, `Emulators`) — everything gets scanned and renamed together.
-2. Check **Also rename folders** if you also want each game's containing folder renamed to `Title [TitleID]`.
+2. Check **Also rename folders** if you also want each game's containing folder renamed to `Title [TitleID]` too. Unchecked by default — leaves folder names untouched, only renames the `.pkg` files.
 3. Optionally check **Order by install size (heaviest first)** — instead of pure alphabetical order, this prefixes every name with a rank number (`001 - `, `002 - `, ...) so the heaviest games install first, while there's still plenty of free space on the console's internal storage. Base/Update/DLC ordering within each game is unaffected. You lose the ability to find a game alphabetically by name in exchange for this.
-4. Optionally set **Pin first** (comma-separated folder name matches, e.g. `RetroArch, PS4-Xplorer`) to force specific apps to install before everything else, ahead of the size ranking — useful for tools you need working early (a file explorer, an emulator whose ROM/data folder you still need to copy over manually).
+4. **Pin first** (comma-separated folder name matches) forces specific apps to install before everything else, ahead of the size ranking — defaults to `RetroArch, PS4-Xplorer`, since those are useful to have working early (a file explorer, an emulator whose ROM/data folder you still need to copy over manually). Edit or clear it for your own setup.
 5. Click **Preview** to see what would change without touching any files.
 6. Click **Apply** to actually rename. A confirmation dialog appears first.
 

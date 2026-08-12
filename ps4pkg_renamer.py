@@ -624,7 +624,7 @@ class PS4PkgRenamerApp(tk.Tk):
 
         options = ttk.Frame(frame)
         options.pack(fill="x", padx=10, pady=(0, 5))
-        self.folders_var = tk.BooleanVar(value=True)
+        self.folders_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(options, text="Also rename folders", variable=self.folders_var).pack(side="left")
         self.rank_by_size_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -636,7 +636,7 @@ class PS4PkgRenamerApp(tk.Tk):
         ttk.Label(pin_frame, text="Pin first (comma-separated, e.g. RetroArch, PS4-Xplorer):").pack(
             side="left"
         )
-        self.pin_var = tk.StringVar()
+        self.pin_var = tk.StringVar(value="RetroArch, PS4-Xplorer")
         ttk.Entry(pin_frame, textvariable=self.pin_var).pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         buttons = ttk.Frame(frame)
