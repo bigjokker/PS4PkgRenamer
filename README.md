@@ -45,12 +45,16 @@ Open the app. It has three tabs:
 
 ### Rename Games
 
-For a folder of games, homebrew apps, or PS1/PS2/PSP-on-PS4 conversions (each game/app in its own subfolder, containing its base + update + DLC pkgs).
+For folders of games, homebrew apps, or PS1/PS2/PSP-on-PS4 conversions (each game/app in its own subfolder, containing its base + update + DLC pkgs).
 
-1. Click **Browse...** and select the folder (e.g. `PS4/Games`, `PS4/Homebrew`, `PS4/Emulators`).
+1. **Add Folder...** one or more roots (e.g. `Games`, `Homebrew`, `Emulators`) — everything gets scanned and renamed together.
 2. Check **Also rename folders** if you also want each game's containing folder renamed to `Title [TitleID]`.
-3. Click **Preview** to see what would change without touching any files.
-4. Click **Apply** to actually rename. A confirmation dialog appears first.
+3. Optionally check **Order by install size (heaviest first)** — instead of pure alphabetical order, this prefixes every name with a rank number (`001 - `, `002 - `, ...) so the heaviest games install first, while there's still plenty of free space on the console's internal storage. Base/Update/DLC ordering within each game is unaffected. You lose the ability to find a game alphabetically by name in exchange for this.
+4. Optionally set **Pin first** (comma-separated folder name matches, e.g. `RetroArch, PS4-Xplorer`) to force specific apps to install before everything else, ahead of the size ranking — useful for tools you need working early (a file explorer, an emulator whose ROM/data folder you still need to copy over manually).
+5. Click **Preview** to see what would change without touching any files.
+6. Click **Apply** to actually rename. A confirmation dialog appears first.
+
+Re-running this after adding a new game recomputes the ranking from scratch across everything, since a new heavy game can shift every rank number after it.
 
 ### Push to End
 
@@ -81,6 +85,7 @@ The pkg file size is a close approximation of the actual installed size, not an 
 - The sort-order marker (`- 0 Base` / `- 1 Update` / `- 2 DLC`) always comes immediately after the title, before any firmware/version text — so the order never flips even if an update happens to require an *older* firmware than the base game.
 - A folder with a single pkg is always treated as the base app, regardless of its internal category — this matters for some homebrew/backport packages that are technically tagged as a "patch" even though they're the only file needed.
 - If two unrelated pkgs end up sharing a folder (same Title ID, different content — e.g. an emulator plus a separate cores installer), each keeps its own title instead of being forced under one shared name.
+- Category matching is by prefix, not exact match (`gd`, `gp`, `ac`) — some PS2-classics conversions use variants like `gdo`/`gpo` instead of `gd`/`gp`.
 
 ---
 

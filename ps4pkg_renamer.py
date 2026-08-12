@@ -17,17 +17,19 @@ APP_TITLE = "PS4PkgRenamer"
 
 SFO_MAGIC = b"\x00PSF"
 
-# CATEGORY -> (etiqueta, orden, sufijo)
 # El juego base tambien lleva un sufijo ("- 0 Base") en vez de quedar
 # vacio: si se dejara sin sufijo, "Nombre.pkg" ordena DESPUES de
 # "Nombre - 1 Update.pkg" porque el espacio (0x20) es menor que el punto
 # (0x2E) en ASCII, invirtiendo el orden que se busca.
-CATEGORY_MAP = {
-    "gd":  ("base",   0, " - 0 Base"),
-    "gde": ("base",   0, " - 0 Base"),   # demo, se trata como base por si aparece
-    "gp":  ("update", 1, " - 1 Update"),
-    "ac":  ("dlc",    2, " - 2 DLC"),
-}
+#
+# Se compara por PREFIJO (no exacto) porque existen variantes ademas de
+# gd/gp/ac: por ejemplo conversiones PS2 (OPOISSO893) usan "gdo"/"gpo" en
+# vez de "gd"/"gp".
+CATEGORY_PREFIXES = (
+    ("gd", ("base",   0, " - 0 Base")),
+    ("gp", ("update", 1, " - 1 Update")),
+    ("ac", ("dlc",    2, " - 2 DLC")),
+)
 FALLBACK_DIGIT_MAP = {
     "1": ("base",   0, " - 0 Base"),
     "2": ("update", 1, " - 1 Update"),
@@ -182,8 +184,15 @@ def classify(entries, original_filename: str):
             title_id = title_id.strip() or None
         fw_version = format_fw_version(entries.get("SYSTEM_VER"))
 
-    if category in CATEGORY_MAP:
-        label, order, suffix = CATEGORY_MAP[category]
+    matched = None
+    if category:
+        for prefix, mapping in CATEGORY_PREFIXES:
+            if category.startswith(prefix):
+                matched = mapping
+                break
+
+    if matched:
+        label, order, suffix = matched
     else:
         # respaldo: usar el digito inicial que ya usa el nombre original (1/2/3)
         m = re.match(r"\s*([123])\b", original_filename)
@@ -208,9 +217,10 @@ def strip_base_prefix(dlc_title: str, base_title: str) -> str:
     return dt
 
 
-def scan_game_folder(folder: str, scan_mb: int, log=None):
+def scan_game_folder(folder: str, scan_mb: int, log=None, rank_prefix: str = ""):
     """Analiza los .pkg de una carpeta y devuelve una lista de dicts con la
-    informacion necesaria para renombrar."""
+    informacion necesaria para renombrar. `rank_prefix` (ej. "001 - ") se
+    antepone al nombre para ordenar por tamano en vez de alfabeticamente."""
     pkg_files = sorted(
         f for f in os.listdir(folder) if f.lower().endswith(".pkg")
     )
@@ -273,6 +283,8 @@ def scan_game_folder(folder: str, scan_mb: int, log=None):
                 break
 
     label = f"{base_title} [{base_title_id}]" if base_title_id else base_title
+    if rank_prefix:
+        label = f"{rank_prefix}{label}"
 
     # Si mas de un pkg quedo clasificado como "base" en la misma carpeta,
     # el supuesto de "un solo juego con base+update+dlc por carpeta" no
@@ -287,6 +299,8 @@ def scan_game_folder(folder: str, scan_mb: int, log=None):
                 os.path.splitext(it["filename"])[0]
             )
             item_label = f"{own_title} [{it['title_id']}]" if it["title_id"] else own_title
+            if rank_prefix:
+                item_label = f"{rank_prefix}{item_label}"
         else:
             item_label = label
 
@@ -340,25 +354,68 @@ def find_game_folders(root: str):
             yield dirpath
 
 
-def rename_games(root: str, apply: bool, folders: bool, scan_mb: int, log):
-    """Escanea/renombra juegos, homebrew o emuladores bajo `root`.
+def compute_rank_prefixes(all_folders, pin_terms):
+    """Devuelve {carpeta: 'NNN - '} ordenando de mas pesada a mas liviana
+    (suma de tamanos de sus .pkg), con las carpetas que coincidan con algun
+    termino de `pin_terms` fijadas primero, en el orden dado."""
+    folder_sizes = {}
+    for folder in all_folders:
+        pkgs = [f for f in os.listdir(folder) if f.lower().endswith(".pkg")]
+        folder_sizes[folder] = sum(os.path.getsize(os.path.join(folder, f)) for f in pkgs)
+
+    remaining = list(all_folders)
+    ranked_order = []
+
+    for term in pin_terms:
+        match = next(
+            (f for f in remaining if term.lower() in os.path.basename(f.rstrip(os.sep)).lower()),
+            None,
+        )
+        if match:
+            ranked_order.append(match)
+            remaining.remove(match)
+
+    remaining.sort(key=lambda f: folder_sizes[f], reverse=True)
+    ranked_order.extend(remaining)
+
+    return {folder: f"{i:03d} - " for i, folder in enumerate(ranked_order, start=1)}
+
+
+def rename_games(roots, apply: bool, folders: bool, scan_mb: int, log, rank_by_size: bool = False, pin=None):
+    """Escanea/renombra juegos, homebrew o emuladores bajo una o mas `roots`.
     Devuelve un dict resumen. `log(message)` recibe cada linea de progreso."""
-    root = os.path.abspath(root)
-    if not os.path.isdir(root):
-        log(f"No existe la carpeta: {root}")
+    if isinstance(roots, str):
+        roots = [roots]
+
+    all_folders = []
+    seen = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            log(f"No existe la carpeta: {root}")
+            continue
+        for folder in find_game_folders(root):
+            if folder not in seen:
+                seen.add(folder)
+                all_folders.append(folder)
+
+    if not all_folders:
+        log("No se encontraron archivos .pkg debajo de esas rutas.")
         return {"total": 0, "unknown": 0, "renamed": 0}
 
-    all_folders = list(find_game_folders(root))
-    if not all_folders:
-        log("No se encontraron archivos .pkg debajo de esa ruta.")
-        return {"total": 0, "unknown": 0, "renamed": 0}
+    rank_prefixes = {}
+    if rank_by_size or pin:
+        rank_prefixes = compute_rank_prefixes(all_folders, pin or [])
 
     total_items = 0
     total_renamed = 0
     total_unknown = 0
 
-    for folder in sorted(all_folders):
-        items = scan_game_folder(folder, scan_mb, log)
+    ordered_folders = (
+        sorted(all_folders, key=lambda f: rank_prefixes[f]) if rank_prefixes else sorted(all_folders)
+    )
+    for folder in ordered_folders:
+        items = scan_game_folder(folder, scan_mb, log, rank_prefix=rank_prefixes.get(folder, ""))
         if not items:
             continue
         log(f"\n== {folder} ==")
@@ -546,22 +603,41 @@ class PS4PkgRenamerApp(tk.Tk):
     def _build_games_tab(self):
         frame = self.games_tab
 
-        path_frame = ttk.Frame(frame)
-        path_frame.pack(fill="x", padx=10, pady=10)
-        ttk.Label(path_frame, text="Target folder (Games / Homebrew / Emulators):").pack(anchor="w")
+        ttk.Label(
+            frame, text="Folders to scan (e.g. Games, Homebrew, Emulators):"
+        ).pack(anchor="w", padx=10, pady=(10, 0))
 
-        picker = ttk.Frame(path_frame)
-        picker.pack(fill="x", pady=(5, 0))
-        self.games_path_var = tk.StringVar()
-        ttk.Entry(picker, textvariable=self.games_path_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(picker, text="Browse...", command=lambda: self._browse_folder(self.games_path_var)).pack(
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="x", padx=10, pady=(5, 0))
+        self.games_listbox = tk.Listbox(list_frame, height=4, selectmode="extended")
+        self.games_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.games_listbox.yview)
+        scrollbar.pack(side="left", fill="y")
+        self.games_listbox.configure(yscrollcommand=scrollbar.set)
+
+        list_buttons = ttk.Frame(frame)
+        list_buttons.pack(fill="x", padx=10, pady=(5, 10))
+        ttk.Button(list_buttons, text="Add Folder...", command=self._add_games_folder).pack(side="left")
+        ttk.Button(list_buttons, text="Remove Selected", command=self._remove_games_folder).pack(
             side="left", padx=(5, 0)
         )
 
         options = ttk.Frame(frame)
-        options.pack(fill="x", padx=10, pady=(0, 10))
+        options.pack(fill="x", padx=10, pady=(0, 5))
         self.folders_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(options, text="Also rename folders", variable=self.folders_var).pack(side="left")
+        self.rank_by_size_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            options, text="Order by install size (heaviest first)", variable=self.rank_by_size_var
+        ).pack(side="left", padx=(15, 0))
+
+        pin_frame = ttk.Frame(frame)
+        pin_frame.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(pin_frame, text="Pin first (comma-separated, e.g. RetroArch, PS4-Xplorer):").pack(
+            side="left"
+        )
+        self.pin_var = tk.StringVar()
+        ttk.Entry(pin_frame, textvariable=self.pin_var).pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
@@ -570,6 +646,15 @@ class PS4PkgRenamerApp(tk.Tk):
 
         self.games_log = scrolledtext.ScrolledText(frame, state="disabled", wrap="word")
         self.games_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _add_games_folder(self):
+        folder = filedialog.askdirectory(title="Select a folder to include")
+        if folder and folder not in self.games_listbox.get(0, tk.END):
+            self.games_listbox.insert(tk.END, folder)
+
+    def _remove_games_folder(self):
+        for idx in reversed(self.games_listbox.curselection()):
+            self.games_listbox.delete(idx)
 
     def _preview_games(self):
         self._run_games(apply=False)
@@ -583,18 +668,21 @@ class PS4PkgRenamerApp(tk.Tk):
         self._run_games(apply=True)
 
     def _run_games(self, apply: bool):
-        target_dir = self.games_path_var.get().strip()
-        if not target_dir or not os.path.isdir(target_dir):
-            messagebox.showerror(APP_TITLE, f"Path not found:\n{target_dir}")
+        roots = list(self.games_listbox.get(0, tk.END))
+        if not roots:
+            messagebox.showerror(APP_TITLE, "Add at least one folder first.")
             return
+        pin = [t.strip() for t in self.pin_var.get().split(",") if t.strip()]
 
         self._clear_log(self.games_log)
         rename_games(
-            target_dir,
+            roots,
             apply=apply,
             folders=self.folders_var.get(),
             scan_mb=DEFAULT_SCAN_MB,
             log=lambda msg: self._log(self.games_log, msg),
+            rank_by_size=self.rank_by_size_var.get(),
+            pin=pin,
         )
 
     # --- Push to End tab ---
