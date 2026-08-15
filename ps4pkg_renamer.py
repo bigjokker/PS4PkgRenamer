@@ -14,7 +14,7 @@ import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -31,19 +31,16 @@ PKG4_MAGIC = b"\x7fCNT"
 PARAM_SFO_ID = 0x1000
 MAX_SFO_SIZE = 1_000_000  # real param.sfo is tiny; reject absurd sizes
 
-# CATEGORY -> (label, order, sort_suffix)
-# Base also gets a suffix ("- 0 Base"): bare "Name.pkg" sorts AFTER
-# "Name - 1 Update.pkg" because space (0x20) < period (0x2E) in ASCII.
-CATEGORY_MAP = {
-    "gd": ("base", 0, " - 0 Base"),
-    "gde": ("base", 0, " - 0 Base"),  # demo treated as base
-    "gda": ("base", 0, " - 0 Base"),  # application-style base
-    "gp": ("update", 1, " - 1 Update"),
-    "gpd": ("update", 1, " - 1 Update"),  # delta / partial patch
-    "ac": ("dlc", 2, " - 2 DLC"),
-    "al": ("dlc", 2, " - 2 DLC"),  # additional content (some pubs)
-    "theme": ("theme", 8, " - 8 Theme"),
-}
+# Match CATEGORY by PREFIX (not exact). PS2-classics conversions use
+# "gdo"/"gpo" instead of "gd"/"gp"; demos / delta patches use "gde"/"gpd".
+# Longer / more specific prefixes first so they win when they differ.
+CATEGORY_PREFIXES = (
+    ("theme", ("theme", 8, " - 8 Theme")),
+    ("gd", ("base", 0, " - 0 Base")),
+    ("gp", ("update", 1, " - 1 Update")),
+    ("ac", ("dlc", 2, " - 2 DLC")),
+    ("al", ("dlc", 2, " - 2 DLC")),  # additional content (some pubs)
+)
 FALLBACK_DIGIT_MAP = {
     "1": ("base", 0, " - 0 Base"),
     "2": ("update", 1, " - 1 Update"),
@@ -70,6 +67,7 @@ MAX_FILENAME_LEN = 255
 
 DEFAULT_SCAN_MB = 48
 DEFAULT_PREFIX = "ZZZ - "
+DEFAULT_PIN = "RetroArch, PS4-Xplorer"
 UNDO_LOG_NAME = ".ps4pkgrenamer_last_undo.json"
 SFO_SCAN_OVERLAP = 256 * 1024  # keep tail so SFO spanning chunks is found
 
@@ -128,6 +126,7 @@ NAME_TEMPLATES = {
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
+PathList = Union[str, Sequence[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +182,12 @@ def same_path(a: str, b: str) -> bool:
 
 def path_parent(path: str) -> str:
     return os.path.dirname(path.rstrip(os.sep))
+
+
+def as_root_list(roots: PathList) -> List[str]:
+    if isinstance(roots, str):
+        return [roots]
+    return list(roots)
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +434,15 @@ def classify(entries, original_filename: str):
             title_id = title_id.strip() or None
         fw_version = format_fw_version(entries.get("SYSTEM_VER"))
 
-    if category in CATEGORY_MAP:
-        label, order, suffix = CATEGORY_MAP[category]
+    matched = None
+    if category:
+        for prefix, mapping in CATEGORY_PREFIXES:
+            if category.startswith(prefix):
+                matched = mapping
+                break
+
+    if matched:
+        label, order, suffix = matched
     else:
         m = re.match(r"\s*([123])\b", original_filename)
         if m:
@@ -501,6 +513,7 @@ def scan_game_folder(
     progress: Optional[ProgressFn] = None,
     progress_base: int = 0,
     progress_total: int = 0,
+    rank_prefix: str = "",
 ) -> List[dict]:
     """Analyze .pkg files in one folder; return rename plan items."""
     pkg_files = sorted(f for f in os.listdir(folder) if f.lower().endswith(".pkg"))
@@ -544,10 +557,10 @@ def scan_game_folder(
         items[0]["order"] = 0
         items[0]["label"] = "base"
 
-    # Prefer title from lowest sort order (Base > Update > DLC > Other).
+    # Prefer title from lowest sort order (Base > Update > DLC > Theme > Other).
     # Filename order alone would pick DLC over Update when Base is missing.
     base_title = None
-    for preferred in (0, 1, 2, 9):
+    for preferred in (0, 1, 2, 8, 9):
         for it in items:
             if it["order"] == preferred and it["title"]:
                 base_title = it["title"]
@@ -559,7 +572,7 @@ def scan_game_folder(
     base_title = sanitize_name(base_title)
 
     base_title_id = None
-    for preferred in (0, 1, 2, 9):
+    for preferred in (0, 1, 2, 8, 9):
         for it in items:
             if it["order"] == preferred and it["title_id"]:
                 base_title_id = it["title_id"]
@@ -611,7 +624,10 @@ def scan_game_folder(
             dlc_or_other_title=dlc_title,
             template_key=template_key,
         )
-        it["base_title"] = label
+        if rank_prefix:
+            stem, _ext = os.path.splitext(it["new_filename"])
+            it["new_filename"] = with_pkg_ext(f"{rank_prefix}{stem}")
+        it["base_title"] = f"{rank_prefix}{label}" if rank_prefix else label
         it["folder"] = folder
 
     # Avoid name collisions within the same folder
@@ -672,6 +688,40 @@ def count_pkgs(folders) -> int:
     return total
 
 
+def compute_rank_prefixes(all_folders, pin_terms):
+    """Return {folder: 'NNN - '} heaviest-first, with pin_terms forced first."""
+    folder_sizes = {}
+    for folder in all_folders:
+        try:
+            pkgs = [f for f in os.listdir(folder) if f.lower().endswith(".pkg")]
+            folder_sizes[folder] = sum(
+                os.path.getsize(os.path.join(folder, f)) for f in pkgs
+            )
+        except OSError:
+            folder_sizes[folder] = 0
+
+    remaining = list(all_folders)
+    ranked_order = []
+
+    for term in pin_terms:
+        match = next(
+            (
+                f
+                for f in remaining
+                if term.lower() in os.path.basename(f.rstrip(os.sep)).lower()
+            ),
+            None,
+        )
+        if match:
+            ranked_order.append(match)
+            remaining.remove(match)
+
+    remaining.sort(key=lambda f: folder_sizes[f], reverse=True)
+    ranked_order.extend(remaining)
+
+    return {folder: f"{i:03d} - " for i, folder in enumerate(ranked_order, start=1)}
+
+
 # ---------------------------------------------------------------------------
 # Preflight + safe apply
 # ---------------------------------------------------------------------------
@@ -701,29 +751,12 @@ def preflight_items(items: List[dict]) -> List[str]:
             if same_path(old_path, new_path):
                 continue
             if os.path.exists(new_path):
-                # Another planned rename of that existing file is OK
-                taking_it = any(
-                    same_path(other["path"], new_path)
-                    and not same_path(
-                        os.path.join(other["folder"], other["new_filename"]),
-                        new_path,
-                    )
-                    for other in group
+                source_of_target = next(
+                    (other for other in group if same_path(other["path"], new_path)),
+                    None,
                 )
-                if not taking_it:
-                    # If the file at new_path is not one we are renaming away
-                    source_of_target = next(
-                        (
-                            other
-                            for other in group
-                            if same_path(other["path"], new_path)
-                        ),
-                        None,
-                    )
-                    if source_of_target is None:
-                        errors.append(
-                            f"Target already exists: {new_path}"
-                        )
+                if source_of_target is None:
+                    errors.append(f"Target already exists: {new_path}")
     return errors
 
 
@@ -871,7 +904,7 @@ def export_preview(path: str, lines: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def rename_games(
-    root: str,
+    roots: PathList,
     apply: bool,
     folders: bool,
     scan_mb: int,
@@ -879,8 +912,10 @@ def rename_games(
     template_key: str,
     log: LogFn,
     progress: Optional[ProgressFn] = None,
+    rank_by_size: bool = False,
+    pin: Optional[Sequence[str]] = None,
 ) -> dict:
-    root = os.path.abspath(root)
+    root_list = [os.path.abspath(r) for r in as_root_list(roots)]
     summary = {
         "total": 0,
         "unknown": 0,
@@ -895,31 +930,52 @@ def rename_games(
         "errors": [],
     }
 
-    if not os.path.isdir(root):
-        log(f"Folder does not exist: {root}")
+    all_folders = []
+    seen = set()
+    missing = []
+    for root in root_list:
+        if not os.path.isdir(root):
+            log(f"Folder does not exist: {root}")
+            missing.append(root)
+            continue
+        for folder in find_game_folders(root, recursive=recursive):
+            if folder not in seen:
+                seen.add(folder)
+                all_folders.append(folder)
+
+    if missing and not all_folders:
         summary["errors"].append("path missing")
         return summary
 
-    all_folders = list(find_game_folders(root, recursive=recursive))
     if not all_folders:
-        log("No .pkg files found under that path.")
+        log("No .pkg files found under those paths.")
         if not recursive:
             log("(Tip: enable 'Scan subfolders' if packages are deeper.)")
         return summary
+
+    rank_prefixes = {}
+    if rank_by_size:
+        rank_prefixes = compute_rank_prefixes(all_folders, list(pin or []))
 
     total_pkgs = count_pkgs(all_folders)
     log(f"Found {len(all_folders)} folder(s), {total_pkgs} .pkg file(s).")
     log(f"SFO: header first, scan fallback (max {scan_mb} MB).")
     log(f"Template: {NAME_PRESETS.get(template_key, (template_key,))[0]}")
     log(f"Scan mode: {'recursive' if recursive else 'root + 1 level only'}")
+    if rank_by_size:
+        pinned = ", ".join(pin or []) or "(none)"
+        log(f"Order: install size, heaviest first (pin first: {pinned})")
     log("")
 
     all_items: List[dict] = []
     done_count = 0
-    for folder in sorted(all_folders):
-        n_here = sum(
-            1 for f in os.listdir(folder) if f.lower().endswith(".pkg")
-        )
+    ordered_folders = (
+        sorted(all_folders, key=lambda f: rank_prefixes[f])
+        if rank_prefixes
+        else sorted(all_folders)
+    )
+    for folder in ordered_folders:
+        n_here = sum(1 for f in os.listdir(folder) if f.lower().endswith(".pkg"))
         items = scan_game_folder(
             folder,
             scan_mb,
@@ -928,6 +984,7 @@ def rename_games(
             progress=progress,
             progress_base=done_count,
             progress_total=total_pkgs,
+            rank_prefix=rank_prefixes.get(folder, ""),
         )
         done_count += n_here
         if not items:
@@ -1034,15 +1091,14 @@ def rename_games(
                     except OSError as e:
                         log(f"  [ERROR] folder rename failed: {e}")
 
-    # Prefer writing undo log next to the scan root's parent if root was a
-    # per-game folder that may have been renamed away.
-    undo_root = root
-    if not os.path.isdir(undo_root):
-        undo_root = os.path.dirname(os.path.abspath(root)) or root
-    undo_path = write_undo_log(undo_root, undo_records, kind="rename_games")
-    if undo_path:
-        log(f"\nUndo log written: {undo_path}")
-        summary["undo_log"] = undo_path
+    undo_root = next((r for r in root_list if os.path.isdir(r)), None)
+    if undo_root is None and root_list:
+        undo_root = os.path.dirname(root_list[0]) or root_list[0]
+    if undo_root:
+        undo_path = write_undo_log(undo_root, undo_records, kind="rename_games")
+        if undo_path:
+            log(f"\nUndo log written: {undo_path}")
+            summary["undo_log"] = undo_path
 
     _log_summary(summary, apply, log)
     summary["_items"] = all_items
@@ -1188,6 +1244,67 @@ def _push_summary(summary: dict, apply: bool, log: LogFn) -> None:
     log("-----------------------------")
 
 
+def human_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.2f} PB"
+
+
+def install_order(roots: PathList, log: LogFn, recursive: bool = True) -> list:
+    """Sum .pkg sizes per game folder and list heaviest-first. Read-only."""
+    entries = []
+    seen_folders = set()
+    for root in as_root_list(roots):
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            log(f"[!] Missing: {root}")
+            continue
+        for folder in find_game_folders(root, recursive=recursive):
+            if folder in seen_folders:
+                continue
+            seen_folders.add(folder)
+            try:
+                pkgs = [f for f in os.listdir(folder) if f.lower().endswith(".pkg")]
+                total = sum(os.path.getsize(os.path.join(folder, f)) for f in pkgs)
+            except OSError as e:
+                log(f"[!] Could not read {folder}: {e}")
+                continue
+            entries.append(
+                {
+                    "folder": folder,
+                    "name": os.path.basename(folder.rstrip(os.sep)),
+                    "num_pkgs": len(pkgs),
+                    "total_bytes": total,
+                }
+            )
+
+    if not entries:
+        log("No folders with .pkg files found.")
+        return []
+
+    entries.sort(key=lambda e: e["total_bytes"], reverse=True)
+
+    running_total = 0
+    log(f"\n{'#':>3}  {'Size':>10}  {'Running':>10}  {'Pkgs':>4}  Folder")
+    log("-" * 80)
+    for i, e in enumerate(entries, start=1):
+        running_total += e["total_bytes"]
+        log(
+            f"{i:>3}  {human_size(e['total_bytes']):>10}  {human_size(running_total):>10}  "
+            f"{e['num_pkgs']:>4}  {e['name']}"
+        )
+
+    log("-" * 80)
+    log(f"Total: {len(entries)} folders, {human_size(running_total)} combined.")
+    log(
+        "\nSuggestion: install top-to-bottom so the heaviest games land "
+        "while free space is still abundant."
+    )
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -1196,8 +1313,8 @@ class PS4PkgRenamerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.geometry("780x640")
-        self.minsize(680, 520)
+        self.geometry("820x700")
+        self.minsize(700, 560)
 
         self._worker: Optional[threading.Thread] = None
         self._msg_q: queue.Queue = queue.Queue()
@@ -1205,17 +1322,21 @@ class PS4PkgRenamerApp(tk.Tk):
         self._last_preview_lines_games: List[str] = []
         self._last_preview_lines_themes: List[str] = []
         self._last_summary: dict = {}
+        self._action_buttons: List[ttk.Button] = []
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         self.games_tab = ttk.Frame(notebook)
         self.themes_tab = ttk.Frame(notebook)
+        self.order_tab = ttk.Frame(notebook)
         notebook.add(self.games_tab, text="Rename Games")
         notebook.add(self.themes_tab, text="Push to End")
+        notebook.add(self.order_tab, text="Install Order")
 
         self._build_games_tab()
         self._build_themes_tab()
+        self._build_order_tab()
         self._build_status_bar()
 
         self.after(100, self._drain_queue)
@@ -1299,38 +1420,57 @@ class PS4PkgRenamerApp(tk.Tk):
     # --- Rename Games tab ---
     def _build_games_tab(self):
         frame = self.games_tab
-        self._action_buttons = []
 
-        path_frame = ttk.Frame(frame)
-        path_frame.pack(fill="x", padx=10, pady=10)
         ttk.Label(
-            path_frame, text="Target folder (Games / Homebrew / Emulators):"
-        ).pack(anchor="w")
+            frame, text="Folders to scan (e.g. Games, Homebrew, Emulators):"
+        ).pack(anchor="w", padx=10, pady=(10, 0))
 
-        picker = ttk.Frame(path_frame)
-        picker.pack(fill="x", pady=(5, 0))
-        self.games_path_var = tk.StringVar()
-        ttk.Entry(picker, textvariable=self.games_path_var).pack(
-            side="left", fill="x", expand=True
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="x", padx=10, pady=(5, 0))
+        self.games_listbox = tk.Listbox(list_frame, height=4, selectmode="extended")
+        self.games_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.games_listbox.yview
         )
+        scrollbar.pack(side="left", fill="y")
+        self.games_listbox.configure(yscrollcommand=scrollbar.set)
+
+        list_buttons = ttk.Frame(frame)
+        list_buttons.pack(fill="x", padx=10, pady=(5, 8))
         ttk.Button(
-            picker,
-            text="Browse...",
-            command=lambda: self._browse_folder(self.games_path_var),
+            list_buttons, text="Add Folder...", command=self._add_games_folder
+        ).pack(side="left")
+        ttk.Button(
+            list_buttons, text="Remove Selected", command=self._remove_games_folder
         ).pack(side="left", padx=(5, 0))
 
         options = ttk.Frame(frame)
-        options.pack(fill="x", padx=10, pady=(0, 6))
-        self.folders_var = tk.BooleanVar(value=True)
+        options.pack(fill="x", padx=10, pady=(0, 5))
+        self.folders_var = tk.BooleanVar(value=False)
         self.recursive_var = tk.BooleanVar(value=True)
+        self.rank_by_size_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options, text="Also rename folders", variable=self.folders_var
         ).pack(side="left")
         ttk.Checkbutton(
-            options,
-            text="Scan subfolders",
-            variable=self.recursive_var,
+            options, text="Scan subfolders", variable=self.recursive_var
         ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            options,
+            text="Order by install size (heaviest first)",
+            variable=self.rank_by_size_var,
+        ).pack(side="left", padx=(12, 0))
+
+        pin_frame = ttk.Frame(frame)
+        pin_frame.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(
+            pin_frame,
+            text="Pin first (comma-separated; used with size order):",
+        ).pack(side="left")
+        self.pin_var = tk.StringVar(value=DEFAULT_PIN)
+        ttk.Entry(pin_frame, textvariable=self.pin_var).pack(
+            side="left", fill="x", expand=True, padx=(5, 0)
+        )
 
         tmpl_row = ttk.Frame(frame)
         tmpl_row.pack(fill="x", padx=10, pady=(0, 8))
@@ -1357,9 +1497,7 @@ class PS4PkgRenamerApp(tk.Tk):
             buttons, text="Export preview...", command=self._export_games_preview
         )
         b_export.pack(side="left", padx=(5, 0))
-        b_undo = ttk.Button(
-            buttons, text="Undo last...", command=self._undo_last
-        )
+        b_undo = ttk.Button(buttons, text="Undo last...", command=self._undo_last)
         b_undo.pack(side="left", padx=(5, 0))
         self._action_buttons.extend([b_prev, b_apply, b_export, b_undo])
 
@@ -1368,6 +1506,15 @@ class PS4PkgRenamerApp(tk.Tk):
         )
         self.games_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._configure_log_tags(self.games_log)
+
+    def _add_games_folder(self):
+        folder = filedialog.askdirectory(title="Select a folder to include")
+        if folder and folder not in self.games_listbox.get(0, tk.END):
+            self.games_listbox.insert(tk.END, folder)
+
+    def _remove_games_folder(self):
+        for idx in reversed(self.games_listbox.curselection()):
+            self.games_listbox.delete(idx)
 
     def _selected_template_key(self) -> str:
         raw = self.template_var.get()
@@ -1390,9 +1537,9 @@ class PS4PkgRenamerApp(tk.Tk):
     def _run_games(self, apply: bool):
         if self._busy:
             return
-        target_dir = self.games_path_var.get().strip()
-        if not target_dir or not os.path.isdir(target_dir):
-            messagebox.showerror(APP_TITLE, f"Path not found:\n{target_dir}")
+        roots = list(self.games_listbox.get(0, tk.END))
+        if not roots:
+            messagebox.showerror(APP_TITLE, "Add at least one folder first.")
             return
 
         self._clear_log(self.games_log)
@@ -1404,6 +1551,8 @@ class PS4PkgRenamerApp(tk.Tk):
         template_key = self._selected_template_key()
         folders = self.folders_var.get()
         recursive = self.recursive_var.get()
+        rank_by_size = self.rank_by_size_var.get()
+        pin = [t.strip() for t in self.pin_var.get().split(",") if t.strip()]
         log_widget = self.games_log
 
         def worker():
@@ -1418,7 +1567,7 @@ class PS4PkgRenamerApp(tk.Tk):
 
             try:
                 summary = rename_games(
-                    target_dir,
+                    roots,
                     apply=apply,
                     folders=folders,
                     scan_mb=DEFAULT_SCAN_MB,
@@ -1426,6 +1575,8 @@ class PS4PkgRenamerApp(tk.Tk):
                     template_key=template_key,
                     log=log,
                     progress=prog,
+                    rank_by_size=rank_by_size,
+                    pin=pin,
                 )
                 self._last_preview_lines_games = lines_capture
                 self._msg_q.put(("done", (log_widget, summary, apply)))
@@ -1479,24 +1630,38 @@ class PS4PkgRenamerApp(tk.Tk):
         except OSError as e:
             messagebox.showerror(APP_TITLE, str(e))
 
+    def _undo_search_paths(self, prefer_themes: bool = False) -> List[str]:
+        games_paths: List[str] = []
+        for d in self.games_listbox.get(0, tk.END):
+            if not d:
+                continue
+            games_paths.append(os.path.join(d, UNDO_LOG_NAME))
+            parent = os.path.dirname(os.path.abspath(d))
+            if parent:
+                games_paths.append(os.path.join(parent, UNDO_LOG_NAME))
+        themes_paths: List[str] = []
+        themes_dir = self.themes_path_var.get().strip()
+        if themes_dir:
+            themes_paths.append(os.path.join(themes_dir, UNDO_LOG_NAME))
+        ordered = (themes_paths + games_paths) if prefer_themes else (games_paths + themes_paths)
+        home = os.path.join(str(Path.home()), UNDO_LOG_NAME)
+        if home not in ordered:
+            ordered.append(home)
+        seen = set()
+        out = []
+        for p in ordered:
+            if p not in seen and os.path.isfile(p):
+                seen.add(p)
+                out.append(p)
+        return out
+
     def _undo_last(self, log_widget=None):
         if self._busy:
             return
         log_widget = log_widget or self.games_log
-        # Prefer undo log inside selected folder (active tab path first)
-        candidates = []
-        path_vars = (self.games_path_var, self.themes_path_var)
-        if log_widget is self.themes_log:
-            path_vars = (self.themes_path_var, self.games_path_var)
-        for path_var in path_vars:
-            d = path_var.get().strip()
-            if d:
-                p = os.path.join(d, UNDO_LOG_NAME)
-                if os.path.isfile(p):
-                    candidates.append(p)
-        home = os.path.join(str(Path.home()), UNDO_LOG_NAME)
-        if os.path.isfile(home) and home not in candidates:
-            candidates.append(home)
+        candidates = self._undo_search_paths(
+            prefer_themes=log_widget is getattr(self, "themes_log", None)
+        )
 
         path = None
         if candidates:
@@ -1676,6 +1841,116 @@ class PS4PkgRenamerApp(tk.Tk):
 
     def _export_themes_preview(self):
         self._export_preview_lines(self._last_preview_lines_themes)
+
+    # --- Install Order tab ---
+    def _build_order_tab(self):
+        frame = self.order_tab
+
+        ttk.Label(
+            frame,
+            text="Folders to include (e.g. Games, Homebrew, Emulators, Themes):",
+        ).pack(anchor="w", padx=10, pady=(10, 0))
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="x", padx=10, pady=(5, 0))
+        self.order_listbox = tk.Listbox(list_frame, height=4, selectmode="extended")
+        self.order_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.order_listbox.yview
+        )
+        scrollbar.pack(side="left", fill="y")
+        self.order_listbox.configure(yscrollcommand=scrollbar.set)
+
+        list_buttons = ttk.Frame(frame)
+        list_buttons.pack(fill="x", padx=10, pady=(5, 10))
+        ttk.Button(
+            list_buttons, text="Add Folder...", command=self._add_order_folder
+        ).pack(side="left")
+        ttk.Button(
+            list_buttons, text="Remove Selected", command=self._remove_order_folder
+        ).pack(side="left", padx=(5, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        b_run = ttk.Button(buttons, text="Generate Report", command=self._run_order)
+        b_run.pack(side="left")
+        b_save = ttk.Button(
+            buttons, text="Save Report...", command=self._save_order_report
+        )
+        b_save.pack(side="left", padx=(5, 0))
+        self._action_buttons.append(b_run)
+
+        self.order_log = scrolledtext.ScrolledText(
+            frame, state="disabled", wrap="none", font=("Consolas", 9)
+        )
+        self.order_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._configure_log_tags(self.order_log)
+
+    def _add_order_folder(self):
+        folder = filedialog.askdirectory(title="Select a folder to include")
+        if folder and folder not in self.order_listbox.get(0, tk.END):
+            self.order_listbox.insert(tk.END, folder)
+
+    def _remove_order_folder(self):
+        for idx in reversed(self.order_listbox.curselection()):
+            self.order_listbox.delete(idx)
+
+    def _run_order(self):
+        if self._busy:
+            return
+        roots = list(self.order_listbox.get(0, tk.END))
+        if not roots:
+            messagebox.showerror(APP_TITLE, "Add at least one folder first.")
+            return
+        self._clear_log(self.order_log)
+        self._set_busy(True)
+        self.summary_var.set("Working...")
+        log_widget = self.order_log
+
+        def worker():
+            def log(msg: str):
+                self._msg_q.put(("log", (log_widget, msg)))
+
+            try:
+                entries = install_order(roots, log=log)
+                self._msg_q.put(
+                    (
+                        "done",
+                        (
+                            log_widget,
+                            {
+                                "total": len(entries),
+                                "planned": 0,
+                                "header": 0,
+                                "scan": 0,
+                                "unknown": 0,
+                            },
+                            False,
+                        ),
+                    )
+                )
+            except Exception as e:
+                self._msg_q.put(("error", str(e)))
+                self._msg_q.put(("done", (log_widget, {}, False)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_order_report(self):
+        content = self.order_log.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showerror(
+                APP_TITLE, "Nothing to save yet — generate a report first."
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save report",
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt")],
+            initialfile="ps4_install_order.txt",
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
 
     # --- shared helpers ---
     def _configure_log_tags(self, widget):
